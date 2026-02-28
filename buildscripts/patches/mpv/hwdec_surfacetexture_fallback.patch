@@ -1,5 +1,5 @@
---- a/video/out/hwdec/hwdec_aimagereader.c
-+++ b/video/out/hwdec/hwdec_aimagereader.c
+--- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 16:23:54.908133300 +0100
++++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 16:24:22.658639700 +0100
 @@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
@@ -42,7 +42,7 @@
  };
  
  const static struct { const char *symbol; int offset; } lib_functions[] = {
-@@ -125,6 +145,204 @@
+@@ -125,6 +145,208 @@
      return true;
  }
  
@@ -73,11 +73,15 @@
 +    "}\n";
 +
 +// Fullscreen quad: position (x,y) + texcoord (s,t)
++// Texcoords are flipped (S: 1→0, T: 1→0) to compensate for the
++// SurfaceTexture transform matrix which is designed for screen rendering
++// (Y-down + mirrored). Without this flip the image appears upside-down
++// and horizontally mirrored when rendered to FBO → MPV.
 +static const float st_quad_vertices[] = {
-+    -1.0f, -1.0f,   0.0f, 0.0f,
-+     1.0f, -1.0f,   1.0f, 0.0f,
-+    -1.0f,  1.0f,   0.0f, 1.0f,
-+     1.0f,  1.0f,   1.0f, 1.0f,
++    -1.0f, -1.0f,   1.0f, 1.0f,
++     1.0f, -1.0f,   0.0f, 1.0f,
++    -1.0f,  1.0f,   1.0f, 0.0f,
++     1.0f,  1.0f,   0.0f, 0.0f,
 +};
 +
 +static GLuint compile_st_shader(struct ra_hwdec *hw, GLenum type, const char *source)
@@ -247,7 +251,7 @@
  static int init(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
-@@ -138,8 +356,7 @@
+@@ -138,8 +360,7 @@
      if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
          return -1;
  
@@ -257,7 +261,7 @@
  
      static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
      static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
-@@ -149,29 +366,37 @@
+@@ -149,29 +370,37 @@
      else
          hw->glsl_extensions = es2_exts;
  
@@ -316,7 +320,7 @@
  
      p->hwctx = (struct mp_hwdec_ctx) {
          .driver_name = hw->driver->name,
-@@ -192,17 +417,22 @@
+@@ -192,17 +421,22 @@
  static void uninit(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
@@ -348,7 +352,7 @@
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -224,13 +454,136 @@
+@@ -224,13 +458,136 @@
      pthread_mutex_unlock(&p->lock);
  }
  
@@ -486,7 +490,7 @@
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +642,27 @@
+@@ -289,8 +646,27 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -515,7 +519,7 @@
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +679,9 @@
+@@ -307,6 +683,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
@@ -525,7 +529,7 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +699,82 @@
+@@ -324,6 +703,82 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
