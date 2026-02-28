@@ -1,5 +1,5 @@
---- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 17:41:59.120394100 +0100
-+++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 17:41:59.262982700 +0100
+--- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 19:28:12.481615800 +0100
++++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 19:28:12.533023500 +0100
 @@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
@@ -349,7 +349,7 @@
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -224,13 +455,142 @@
+@@ -224,13 +455,137 @@
      pthread_mutex_unlock(&p->lock);
  }
  
@@ -361,18 +361,16 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
-+    // Create RGB565 texture as FBO render target.
-+    // RGB565 (16-bit) halves GPU memory bandwidth vs RGBA (32-bit).
-+    // At 4K: 16MB/frame instead of 33MB/frame.
-+    // GL_NEAREST avoids interpolation overhead (1:1 pixel mapping).
++    // Create RGBA texture as FBO render target.
++    // GL_NEAREST avoids interpolation overhead (1:1 pixel mapping at 4K).
 +    gl->GenTextures(1, &p->st_fbo_texture);
 +    gl->BindTexture(GL_TEXTURE_2D, p->st_fbo_texture);
 +    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 +    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB,
-+                 GL_UNSIGNED_SHORT_5_6_5, NULL);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
++                 GL_UNSIGNED_BYTE, NULL);
 +    gl->BindTexture(GL_TEXTURE_2D, 0);
 +
 +    // Create FBO
@@ -466,19 +464,16 @@
 +        mapper->dst_params.imgfmt = IMGFMT_RGB0;
 +        mapper->dst_params.hw_subfmt = 0;
 +
-+        // Wrap the FBO RGB565 texture for MPV.
-+        // Use ra format rgb8 (3 components, 1 byte) — closest match.
-+        // The actual GL texture is RGB565 but MPV only needs the
-+        // component count and render_src flag to sample it correctly.
++        // Wrap the FBO RGBA texture for MPV.
 +        struct ra_tex_params params = {
 +            .dimensions = 2,
 +            .w = w,
 +            .h = h,
 +            .d = 1,
-+            .format = ra_find_unorm_format(mapper->ra, 3, 1),
++            .format = ra_find_unorm_format(mapper->ra, 1, 4),
 +            .render_src = true,
 +            .src_linear = false,  // GL_NEAREST, no linear filtering
-+            .external_oes = false,  // regular RGB texture
++            .external_oes = false,  // regular RGBA texture
 +        };
 +        if (params.format->ctype != RA_CTYPE_UNORM)
 +            return -1;
@@ -493,7 +488,7 @@
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +649,27 @@
+@@ -289,8 +644,27 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -522,7 +517,7 @@
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +686,9 @@
+@@ -307,6 +681,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
@@ -532,7 +527,7 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +706,82 @@
+@@ -324,6 +701,82 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
