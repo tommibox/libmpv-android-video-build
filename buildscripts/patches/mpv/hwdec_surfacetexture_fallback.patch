@@ -1,16 +1,17 @@
-diff --git a/video/out/hwdec/hwdec_aimagereader.c b/video/out/hwdec/hwdec_aimagereader.c
-index 93ced50..c86efb9 100644
 --- a/video/out/hwdec/hwdec_aimagereader.c
 +++ b/video/out/hwdec/hwdec_aimagereader.c
-@@ -20,6 +20,7 @@
+@@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
  #include <dlfcn.h>
 +#include <unistd.h>
  #include <EGL/egl.h>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
  #include <media/NdkImageReader.h>
  #include <android/native_window_jni.h>
-@@ -42,6 +43,16 @@ struct priv_owner {
+ #include <libavcodec/mediacodec.h>
+@@ -42,6 +45,17 @@
      jobject surface;
      void *lib_handle;
  
@@ -21,17 +22,82 @@ index 93ced50..c86efb9 100644
 +    jclass stClass;               // cached class ref
 +    jmethodID stUpdateTexImage;
 +    jmethodID stGetTimestamp;
++    jmethodID stGetTransformMatrix;
 +    jmethodID stRelease;
 +    jmethodID surfaceRelease;
 +
      media_status_t (*AImageReader_newWithUsage)(
          int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
      media_status_t (*AImageReader_getWindow)(
-@@ -125,6 +136,115 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
+@@ -73,6 +87,12 @@
+     EGLClientBuffer (EGLAPIENTRY *GetNativeClientBufferANDROID)(
+         const struct AHardwareBuffer *);
+     void (EGLAPIENTRY *EGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
++
++    // SurfaceTexture FBO rendering
++    GLuint st_fbo;
++    GLuint st_fbo_texture;
++    GLuint st_program;
++    GLint st_loc_transform;
+ };
+ 
+ const static struct { const char *symbol; int offset; } lib_functions[] = {
+@@ -125,6 +145,204 @@
      return true;
  }
  
 +// --- SurfaceTexture fallback for devices missing AImageReader symbols ---
++
++// Shader sources for OES → RGBA FBO blit with SurfaceTexture transform matrix.
++// The transform matrix from SurfaceTexture.getTransformMatrix() maps texture
++// coordinates to the actual video region, handling stride alignment and Y-flip.
++
++static const char *st_vertex_shader =
++    "attribute vec4 aPosition;\n"
++    "attribute vec2 aTexCoord;\n"
++    "varying vec2 vTexCoord;\n"
++    "void main() {\n"
++    "    gl_Position = aPosition;\n"
++    "    vTexCoord = aTexCoord;\n"
++    "}\n";
++
++static const char *st_fragment_shader =
++    "#extension GL_OES_EGL_image_external : require\n"
++    "precision mediump float;\n"
++    "uniform samplerExternalOES uTexture;\n"
++    "uniform mat4 uSTMatrix;\n"
++    "varying vec2 vTexCoord;\n"
++    "void main() {\n"
++    "    vec2 tc = (uSTMatrix * vec4(vTexCoord, 0.0, 1.0)).xy;\n"
++    "    gl_FragColor = texture2D(uTexture, tc);\n"
++    "}\n";
++
++// Fullscreen quad: position (x,y) + texcoord (s,t)
++static const float st_quad_vertices[] = {
++    -1.0f, -1.0f,   0.0f, 0.0f,
++     1.0f, -1.0f,   1.0f, 0.0f,
++    -1.0f,  1.0f,   0.0f, 1.0f,
++     1.0f,  1.0f,   1.0f, 1.0f,
++};
++
++static GLuint compile_st_shader(struct ra_hwdec *hw, GLenum type, const char *source)
++{
++    GLuint shader = glCreateShader(type);
++    if (!shader)
++        return 0;
++    glShaderSource(shader, 1, &source, NULL);
++    glCompileShader(shader);
++    GLint status = 0;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char log_buf[512];
++        glGetShaderInfoLog(shader, sizeof(log_buf), NULL, log_buf);
++        MP_ERR(hw, "Shader compile error: %s\n", log_buf);
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
 +
 +static bool init_surfacetexture(struct ra_hwdec *hw)
 +{
@@ -61,8 +127,11 @@ index 93ced50..c86efb9 100644
 +    jmethodID stCtor = (*env)->GetMethodID(env, stClass, "<init>", "(I)V");
 +    p->stUpdateTexImage = (*env)->GetMethodID(env, stClass, "updateTexImage", "()V");
 +    p->stGetTimestamp = (*env)->GetMethodID(env, stClass, "getTimestamp", "()J");
++    p->stGetTransformMatrix = (*env)->GetMethodID(env, stClass,
++        "getTransformMatrix", "([F)V");
 +    p->stRelease = (*env)->GetMethodID(env, stClass, "release", "()V");
-+    if (!stCtor || !p->stUpdateTexImage || !p->stGetTimestamp || !p->stRelease) {
++    if (!stCtor || !p->stUpdateTexImage || !p->stGetTimestamp ||
++        !p->stGetTransformMatrix || !p->stRelease) {
 +        MP_ERR(hw, "SurfaceTexture methods not found\n");
 +        return false;
 +    }
@@ -104,6 +173,41 @@ index 93ced50..c86efb9 100644
 +    (*env)->DeleteLocalRef(env, stClass);
 +    (*env)->DeleteLocalRef(env, surfaceClass);
 +
++    // Compile shader program for OES → RGBA blit with transform matrix
++    GLuint vert = compile_st_shader(hw, GL_VERTEX_SHADER, st_vertex_shader);
++    GLuint frag = compile_st_shader(hw, GL_FRAGMENT_SHADER, st_fragment_shader);
++    if (!vert || !frag) {
++        if (vert) glDeleteShader(vert);
++        if (frag) glDeleteShader(frag);
++        MP_ERR(hw, "SurfaceTexture shader compilation failed\n");
++        return false;
++    }
++
++    GLuint prog = glCreateProgram();
++    glAttachShader(prog, vert);
++    glAttachShader(prog, frag);
++    glBindAttribLocation(prog, 0, "aPosition");
++    glBindAttribLocation(prog, 1, "aTexCoord");
++    glLinkProgram(prog);
++    glDeleteShader(vert);
++    glDeleteShader(frag);
++
++    GLint linked = 0;
++    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
++    if (!linked) {
++        char log_buf[512];
++        glGetProgramInfoLog(prog, sizeof(log_buf), NULL, log_buf);
++        MP_ERR(hw, "Shader link error: %s\n", log_buf);
++        glDeleteProgram(prog);
++        return false;
++    }
++
++    // Store program in priv_owner temporarily — mapper_init will move to priv
++    // Actually, we store the program ID in the owner struct for mapper access.
++    // Since priv_owner doesn't have the program field, we'll create the program
++    // in mapper_init instead. For now, just verify it works and clean up.
++    glDeleteProgram(prog);
++
 +    MP_INFO(hw, "SurfaceTexture fallback initialized (texture=%u)\n",
 +            p->st_gl_texture);
 +    return true;
@@ -143,7 +247,7 @@ index 93ced50..c86efb9 100644
  static int init(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
-@@ -138,8 +258,7 @@ static int init(struct ra_hwdec *hw)
+@@ -138,8 +356,7 @@
      if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
          return -1;
  
@@ -153,7 +257,7 @@ index 93ced50..c86efb9 100644
  
      static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
      static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
-@@ -149,29 +268,37 @@ static int init(struct ra_hwdec *hw)
+@@ -149,29 +366,37 @@
      else
          hw->glsl_extensions = es2_exts;
  
@@ -182,6 +286,8 @@ index 93ced50..c86efb9 100644
 -    if (ret != AMEDIA_OK) {
 -        MP_ERR(hw, "getWindow failed: %d\n", ret);
 -        return -1;
+-    }
+-    assert(window);
 +        ANativeWindow *window;
 +        ret = p->AImageReader_getWindow(p->reader, &window);
 +        if (ret != AMEDIA_OK) {
@@ -189,7 +295,12 @@ index 93ced50..c86efb9 100644
 +            return -1;
 +        }
 +        assert(window);
-+
+ 
+-    JNIEnv *env = MP_JNI_GET_ENV(hw);
+-    assert(env);
+-    jobject surface = p->ANativeWindow_toSurface(env, window);
+-    p->surface = (*env)->NewGlobalRef(env, surface);
+-    (*env)->DeleteLocalRef(env, surface);
 +        JNIEnv *env = MP_JNI_GET_ENV(hw);
 +        assert(env);
 +        jobject surface = p->ANativeWindow_toSurface(env, window);
@@ -201,18 +312,11 @@ index 93ced50..c86efb9 100644
 +        if (!init_surfacetexture(hw))
 +            return -1;
 +        p->use_surfacetexture = true;
-     }
--    assert(window);
--
--    JNIEnv *env = MP_JNI_GET_ENV(hw);
--    assert(env);
--    jobject surface = p->ANativeWindow_toSurface(env, window);
--    p->surface = (*env)->NewGlobalRef(env, surface);
--    (*env)->DeleteLocalRef(env, surface);
++    }
  
      p->hwctx = (struct mp_hwdec_ctx) {
          .driver_name = hw->driver->name,
-@@ -192,17 +319,22 @@ static int init(struct ra_hwdec *hw)
+@@ -192,17 +417,22 @@
  static void uninit(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
@@ -228,15 +332,15 @@ index 93ced50..c86efb9 100644
 +    } else {
 +        JNIEnv *env = MP_JNI_GET_ENV(hw);
 +        assert(env);
- 
--    if (p->reader) {
--        p->AImageReader_delete(p->reader);
--        p->reader = NULL;
++
 +        if (p->surface) {
 +            (*env)->DeleteGlobalRef(env, p->surface);
 +            p->surface = NULL;
 +        }
-+
+ 
+-    if (p->reader) {
+-        p->AImageReader_delete(p->reader);
+-        p->reader = NULL;
 +        if (p->reader) {
 +            p->AImageReader_delete(p->reader);
 +            p->reader = NULL;
@@ -244,35 +348,136 @@ index 93ced50..c86efb9 100644
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -228,9 +360,35 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
+@@ -224,13 +454,136 @@
+     pthread_mutex_unlock(&p->lock);
+ }
+ 
+-static int mapper_init(struct ra_hwdec_mapper *mapper)
++// Create FBO + shader for SurfaceTexture OES → RGBA blit
++static bool init_st_fbo(struct ra_hwdec_mapper *mapper, int w, int h)
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
--    GL *gl = ra_gl_get(mapper->ra);
+     GL *gl = ra_gl_get(mapper->ra);
  
++    // Create RGBA texture as FBO render target
++    gl->GenTextures(1, &p->st_fbo_texture);
++    gl->BindTexture(GL_TEXTURE_2D, p->st_fbo_texture);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
++                 GL_UNSIGNED_BYTE, NULL);
++    gl->BindTexture(GL_TEXTURE_2D, 0);
++
++    // Create FBO
++    glGenFramebuffers(1, &p->st_fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, p->st_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, p->st_fbo_texture, 0);
++    GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
++        MP_ERR(mapper, "SurfaceTexture FBO incomplete: 0x%x\n", fbo_status);
++        return false;
++    }
++
++    // Compile shader program
++    GLuint vert = glCreateShader(GL_VERTEX_SHADER);
++    glShaderSource(vert, 1, &st_vertex_shader, NULL);
++    glCompileShader(vert);
++    GLint status = 0;
++    glGetShaderiv(vert, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char buf[512];
++        glGetShaderInfoLog(vert, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST vertex shader error: %s\n", buf);
++        glDeleteShader(vert);
++        return false;
++    }
++
++    GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
++    glShaderSource(frag, 1, &st_fragment_shader, NULL);
++    glCompileShader(frag);
++    glGetShaderiv(frag, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char buf[512];
++        glGetShaderInfoLog(frag, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST fragment shader error: %s\n", buf);
++        glDeleteShader(vert);
++        glDeleteShader(frag);
++        return false;
++    }
++
++    p->st_program = glCreateProgram();
++    glAttachShader(p->st_program, vert);
++    glAttachShader(p->st_program, frag);
++    glBindAttribLocation(p->st_program, 0, "aPosition");
++    glBindAttribLocation(p->st_program, 1, "aTexCoord");
++    glLinkProgram(p->st_program);
++    glDeleteShader(vert);
++    glDeleteShader(frag);
++
++    GLint linked = 0;
++    glGetProgramiv(p->st_program, GL_LINK_STATUS, &linked);
++    if (!linked) {
++        char buf[512];
++        glGetProgramInfoLog(p->st_program, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST program link error: %s\n", buf);
++        glDeleteProgram(p->st_program);
++        p->st_program = 0;
++        return false;
++    }
++
++    p->st_loc_transform = glGetUniformLocation(p->st_program, "uSTMatrix");
++    GLint tex_loc = glGetUniformLocation(p->st_program, "uTexture");
++
++    // Set texture unit 0 for the sampler (once, doesn't change)
++    glUseProgram(p->st_program);
++    glUniform1i(tex_loc, 0);
++    glUseProgram(0);
++
++    MP_INFO(mapper, "SurfaceTexture FBO initialized (%dx%d)\n", w, h);
++    return true;
++}
++
++static int mapper_init(struct ra_hwdec_mapper *mapper)
++{
++    struct priv *p = mapper->priv;
++    struct priv_owner *o = mapper->owner->priv;
++
      p->log = mapper->log;
 +
 +    if (o->use_surfacetexture) {
-+        // SurfaceTexture path: use the shared OES texture from priv_owner
++        // SurfaceTexture path: render OES → RGBA FBO, expose FBO texture to MPV.
++        int w = mapper->src_params.w;
++        int h = mapper->src_params.h;
++
++        if (!init_st_fbo(mapper, w, h))
++            return -1;
++
 +        mapper->dst_params = mapper->src_params;
 +        mapper->dst_params.imgfmt = IMGFMT_RGB0;
 +        mapper->dst_params.hw_subfmt = 0;
 +
++        // Wrap the FBO RGBA texture (NOT OES) for MPV
 +        struct ra_tex_params params = {
 +            .dimensions = 2,
-+            .w = mapper->src_params.w,
-+            .h = mapper->src_params.h,
++            .w = w,
++            .h = h,
 +            .d = 1,
 +            .format = ra_find_unorm_format(mapper->ra, 1, 4),
 +            .render_src = true,
 +            .src_linear = true,
-+            .external_oes = true,
++            .external_oes = false,  // regular RGBA texture
 +        };
 +        if (params.format->ctype != RA_CTYPE_UNORM)
 +            return -1;
 +
 +        mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params,
-+                                               o->st_gl_texture);
++                                               p->st_fbo_texture);
 +        return mapper->tex[0] ? 0 : -1;
 +    }
 +
@@ -281,7 +486,7 @@ index 93ced50..c86efb9 100644
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +447,13 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
+@@ -289,8 +642,27 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -289,6 +494,20 @@ index 93ced50..c86efb9 100644
  
 +    if (o->use_surfacetexture) {
 +        ra_tex_free(mapper->ra, &mapper->tex[0]);
++
++        if (p->st_fbo) {
++            glDeleteFramebuffers(1, &p->st_fbo);
++            p->st_fbo = 0;
++        }
++        if (p->st_fbo_texture) {
++            GL *gl = ra_gl_get(mapper->ra);
++            gl->DeleteTextures(1, &p->st_fbo_texture);
++            p->st_fbo_texture = 0;
++        }
++        if (p->st_program) {
++            glDeleteProgram(p->st_program);
++            p->st_program = 0;
++        }
 +        return;
 +    }
 +
@@ -296,22 +515,22 @@ index 93ced50..c86efb9 100644
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +470,9 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
+@@ -307,6 +679,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
 +    if (o->use_surfacetexture)
-+        return; // SurfaceTexture manages the texture content
++        return; // FBO texture content persists until next map
 +
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +490,43 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+@@ -324,6 +699,82 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
 +    if (o->use_surfacetexture) {
-+        // --- SurfaceTexture path ---
++        // --- SurfaceTexture path with FBO blit ---
 +        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
 +            return -1;
 +        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
@@ -342,7 +561,46 @@ index 93ced50..c86efb9 100644
 +            usleep(2000); // 2ms between polls
 +        }
 +
-+        // OES texture is now updated — no further binding needed
++        // Get the SurfaceTexture transform matrix (handles crop + Y-flip)
++        jfloatArray matArr = (*env)->NewFloatArray(env, 16);
++        (*env)->CallVoidMethod(env, o->surfaceTexture,
++                               o->stGetTransformMatrix, matArr);
++        float stMatrix[16];
++        (*env)->GetFloatArrayRegion(env, matArr, 0, 16, stMatrix);
++        (*env)->DeleteLocalRef(env, matArr);
++
++        // Save GL state that we'll modify
++        GLint prev_fbo = 0, prev_program = 0, prev_viewport[4];
++        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
++        glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
++        glGetIntegerv(GL_VIEWPORT, prev_viewport);
++
++        // Render OES texture → FBO with transform matrix applied
++        glBindFramebuffer(GL_FRAMEBUFFER, p->st_fbo);
++        glViewport(0, 0, mapper->src_params.w, mapper->src_params.h);
++
++        glUseProgram(p->st_program);
++        glUniformMatrix4fv(p->st_loc_transform, 1, GL_FALSE, stMatrix);
++
++        glActiveTexture(GL_TEXTURE0);
++        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, o->st_gl_texture);
++
++        glEnableVertexAttribArray(0);
++        glEnableVertexAttribArray(1);
++        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, st_quad_vertices);
++        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, st_quad_vertices + 2);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        glDisableVertexAttribArray(0);
++        glDisableVertexAttribArray(1);
++
++        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++
++        // Restore GL state
++        glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
++        glUseProgram(prev_program);
++        glViewport(prev_viewport[0], prev_viewport[1],
++                   prev_viewport[2], prev_viewport[3]);
++
 +        return 0;
 +    }
 +
@@ -350,10 +608,3 @@ index 93ced50..c86efb9 100644
      {
          if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
              return -1;
-@@ -400,4 +603,4 @@ const struct ra_hwdec_driver ra_hwdec_aimagereader = {
-         .map = mapper_map,
-         .unmap = mapper_unmap,
-     },
--};
-+};
-\ No newline at end of file
