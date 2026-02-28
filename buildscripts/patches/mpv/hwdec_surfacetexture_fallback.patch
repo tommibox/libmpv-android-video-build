@@ -1,5 +1,5 @@
---- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 19:28:12.481615800 +0100
-+++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 19:28:12.533023500 +0100
+--- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 20:41:42.295292200 +0100
++++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 20:41:42.349154800 +0100
 @@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
@@ -63,7 +63,7 @@
 +
 +static const char *st_fragment_shader =
 +    "#extension GL_OES_EGL_image_external : require\n"
-+    "precision lowp float;\n"
++    "precision mediump float;\n"
 +    "uniform samplerExternalOES uTexture;\n"
 +    "uniform mat4 uSTMatrix;\n"
 +    "varying vec2 vTexCoord;\n"
@@ -472,7 +472,7 @@
 +            .d = 1,
 +            .format = ra_find_unorm_format(mapper->ra, 1, 4),
 +            .render_src = true,
-+            .src_linear = false,  // GL_NEAREST, no linear filtering
++            .src_linear = true,
 +            .external_oes = false,  // regular RGBA texture
 +        };
 +        if (params.format->ctype != RA_CTYPE_UNORM)
