@@ -1,0 +1,359 @@
+diff --git a/video/out/hwdec/hwdec_aimagereader.c b/video/out/hwdec/hwdec_aimagereader.c
+index 93ced50..c86efb9 100644
+--- a/video/out/hwdec/hwdec_aimagereader.c
++++ b/video/out/hwdec/hwdec_aimagereader.c
+@@ -20,6 +20,7 @@
+ #include <assert.h>
+ #include <pthread.h>
+ #include <dlfcn.h>
++#include <unistd.h>
+ #include <EGL/egl.h>
+ #include <media/NdkImageReader.h>
+ #include <android/native_window_jni.h>
+@@ -42,6 +43,16 @@ struct priv_owner {
+     jobject surface;
+     void *lib_handle;
+ 
++    // SurfaceTexture fallback (used when AImageReader symbols are missing)
++    bool use_surfacetexture;
++    jobject surfaceTexture;       // android.graphics.SurfaceTexture (global ref)
++    GLuint st_gl_texture;         // GL_TEXTURE_EXTERNAL_OES for SurfaceTexture
++    jclass stClass;               // cached class ref
++    jmethodID stUpdateTexImage;
++    jmethodID stGetTimestamp;
++    jmethodID stRelease;
++    jmethodID surfaceRelease;
++
+     media_status_t (*AImageReader_newWithUsage)(
+         int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
+     media_status_t (*AImageReader_getWindow)(
+@@ -125,6 +136,115 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
+     return true;
+ }
+ 
++// --- SurfaceTexture fallback for devices missing AImageReader symbols ---
++
++static bool init_surfacetexture(struct ra_hwdec *hw)
++{
++    struct priv_owner *p = hw->priv;
++    GL *gl = ra_gl_get(hw->ra_ctx->ra);
++    JNIEnv *env = MP_JNI_GET_ENV(hw);
++    if (!env)
++        return false;
++
++    // Create OES texture for SurfaceTexture
++    gl->GenTextures(1, &p->st_gl_texture);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->st_gl_texture);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++
++    // Find SurfaceTexture class and methods
++    jclass stClass = (*env)->FindClass(env, "android/graphics/SurfaceTexture");
++    if (!stClass) {
++        MP_ERR(hw, "SurfaceTexture class not found\n");
++        return false;
++    }
++    p->stClass = (*env)->NewGlobalRef(env, stClass);
++
++    jmethodID stCtor = (*env)->GetMethodID(env, stClass, "<init>", "(I)V");
++    p->stUpdateTexImage = (*env)->GetMethodID(env, stClass, "updateTexImage", "()V");
++    p->stGetTimestamp = (*env)->GetMethodID(env, stClass, "getTimestamp", "()J");
++    p->stRelease = (*env)->GetMethodID(env, stClass, "release", "()V");
++    if (!stCtor || !p->stUpdateTexImage || !p->stGetTimestamp || !p->stRelease) {
++        MP_ERR(hw, "SurfaceTexture methods not found\n");
++        return false;
++    }
++
++    // Find Surface class and methods
++    jclass surfaceClass = (*env)->FindClass(env, "android/view/Surface");
++    if (!surfaceClass) {
++        MP_ERR(hw, "Surface class not found\n");
++        return false;
++    }
++    jmethodID surfaceCtor = (*env)->GetMethodID(env, surfaceClass, "<init>",
++        "(Landroid/graphics/SurfaceTexture;)V");
++    p->surfaceRelease = (*env)->GetMethodID(env, surfaceClass, "release", "()V");
++    if (!surfaceCtor || !p->surfaceRelease) {
++        MP_ERR(hw, "Surface methods not found\n");
++        return false;
++    }
++
++    // Create SurfaceTexture(texName)
++    jobject st = (*env)->NewObject(env, stClass, stCtor, (jint)p->st_gl_texture);
++    if (!st || (*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        MP_ERR(hw, "Failed to create SurfaceTexture\n");
++        return false;
++    }
++    p->surfaceTexture = (*env)->NewGlobalRef(env, st);
++    (*env)->DeleteLocalRef(env, st);
++
++    // Create Surface(surfaceTexture)
++    jobject surface = (*env)->NewObject(env, surfaceClass, surfaceCtor,
++                                        p->surfaceTexture);
++    if (!surface || (*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        MP_ERR(hw, "Failed to create Surface from SurfaceTexture\n");
++        return false;
++    }
++    p->surface = (*env)->NewGlobalRef(env, surface);
++    (*env)->DeleteLocalRef(env, surface);
++    (*env)->DeleteLocalRef(env, stClass);
++    (*env)->DeleteLocalRef(env, surfaceClass);
++
++    MP_INFO(hw, "SurfaceTexture fallback initialized (texture=%u)\n",
++            p->st_gl_texture);
++    return true;
++}
++
++static void uninit_surfacetexture(struct ra_hwdec *hw)
++{
++    struct priv_owner *p = hw->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(hw);
++    GL *gl = ra_gl_get(hw->ra_ctx->ra);
++
++    if (env) {
++        if (p->surface) {
++            (*env)->CallVoidMethod(env, p->surface, p->surfaceRelease);
++            (*env)->DeleteGlobalRef(env, p->surface);
++            p->surface = NULL;
++        }
++        if (p->surfaceTexture) {
++            (*env)->CallVoidMethod(env, p->surfaceTexture, p->stRelease);
++            (*env)->DeleteGlobalRef(env, p->surfaceTexture);
++            p->surfaceTexture = NULL;
++        }
++        if (p->stClass) {
++            (*env)->DeleteGlobalRef(env, (jobject)p->stClass);
++            p->stClass = NULL;
++        }
++    }
++
++    if (p->st_gl_texture) {
++        gl->DeleteTextures(1, &p->st_gl_texture);
++        p->st_gl_texture = 0;
++    }
++}
++
++// --- Main hwdec callbacks ---
++
+ static int init(struct ra_hwdec *hw)
+ {
+     struct priv_owner *p = hw->priv;
+@@ -138,8 +258,7 @@ static int init(struct ra_hwdec *hw)
+     if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
+         return -1;
+ 
+-    if (!load_lib_functions(p, hw->log))
+-        return -1;
++    bool aimagereader_ok = load_lib_functions(p, hw->log);
+ 
+     static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
+     static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
+@@ -149,29 +268,37 @@ static int init(struct ra_hwdec *hw)
+     else
+         hw->glsl_extensions = es2_exts;
+ 
+-    // dummy dimensions, AImageReader only transports hardware buffers
+-    media_status_t ret = p->AImageReader_newWithUsage(16, 16,
+-        AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+-        5, &p->reader);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(hw, "newWithUsage failed: %d\n", ret);
+-        return -1;
+-    }
+-    assert(p->reader);
++    if (aimagereader_ok) {
++        // Normal AImageReader path
++        media_status_t ret = p->AImageReader_newWithUsage(16, 16,
++            AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
++            5, &p->reader);
++        if (ret != AMEDIA_OK) {
++            MP_ERR(hw, "newWithUsage failed: %d\n", ret);
++            return -1;
++        }
++        assert(p->reader);
+ 
+-    ANativeWindow *window;
+-    ret = p->AImageReader_getWindow(p->reader, &window);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(hw, "getWindow failed: %d\n", ret);
+-        return -1;
++        ANativeWindow *window;
++        ret = p->AImageReader_getWindow(p->reader, &window);
++        if (ret != AMEDIA_OK) {
++            MP_ERR(hw, "getWindow failed: %d\n", ret);
++            return -1;
++        }
++        assert(window);
++
++        JNIEnv *env = MP_JNI_GET_ENV(hw);
++        assert(env);
++        jobject surface = p->ANativeWindow_toSurface(env, window);
++        p->surface = (*env)->NewGlobalRef(env, surface);
++        (*env)->DeleteLocalRef(env, surface);
++    } else {
++        // SurfaceTexture fallback for Fire OS and similar
++        MP_INFO(hw, "AImageReader symbols incomplete, using SurfaceTexture fallback\n");
++        if (!init_surfacetexture(hw))
++            return -1;
++        p->use_surfacetexture = true;
+     }
+-    assert(window);
+-
+-    JNIEnv *env = MP_JNI_GET_ENV(hw);
+-    assert(env);
+-    jobject surface = p->ANativeWindow_toSurface(env, window);
+-    p->surface = (*env)->NewGlobalRef(env, surface);
+-    (*env)->DeleteLocalRef(env, surface);
+ 
+     p->hwctx = (struct mp_hwdec_ctx) {
+         .driver_name = hw->driver->name,
+@@ -192,17 +319,22 @@ static int init(struct ra_hwdec *hw)
+ static void uninit(struct ra_hwdec *hw)
+ {
+     struct priv_owner *p = hw->priv;
+-    JNIEnv *env = MP_JNI_GET_ENV(hw);
+-    assert(env);
+ 
+-    if (p->surface) {
+-        (*env)->DeleteGlobalRef(env, p->surface);
+-        p->surface = NULL;
+-    }
++    if (p->use_surfacetexture) {
++        uninit_surfacetexture(hw);
++    } else {
++        JNIEnv *env = MP_JNI_GET_ENV(hw);
++        assert(env);
+ 
+-    if (p->reader) {
+-        p->AImageReader_delete(p->reader);
+-        p->reader = NULL;
++        if (p->surface) {
++            (*env)->DeleteGlobalRef(env, p->surface);
++            p->surface = NULL;
++        }
++
++        if (p->reader) {
++            p->AImageReader_delete(p->reader);
++            p->reader = NULL;
++        }
+     }
+ 
+     hwdec_devices_remove(hw->devs, &p->hwctx);
+@@ -228,9 +360,35 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
+ {
+     struct priv *p = mapper->priv;
+     struct priv_owner *o = mapper->owner->priv;
+-    GL *gl = ra_gl_get(mapper->ra);
+ 
+     p->log = mapper->log;
++
++    if (o->use_surfacetexture) {
++        // SurfaceTexture path: use the shared OES texture from priv_owner
++        mapper->dst_params = mapper->src_params;
++        mapper->dst_params.imgfmt = IMGFMT_RGB0;
++        mapper->dst_params.hw_subfmt = 0;
++
++        struct ra_tex_params params = {
++            .dimensions = 2,
++            .w = mapper->src_params.w,
++            .h = mapper->src_params.h,
++            .d = 1,
++            .format = ra_find_unorm_format(mapper->ra, 1, 4),
++            .render_src = true,
++            .src_linear = true,
++            .external_oes = true,
++        };
++        if (params.format->ctype != RA_CTYPE_UNORM)
++            return -1;
++
++        mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params,
++                                               o->st_gl_texture);
++        return mapper->tex[0] ? 0 : -1;
++    }
++
++    // Normal AImageReader path
++    GL *gl = ra_gl_get(mapper->ra);
+     pthread_mutex_init(&p->lock, NULL);
+     pthread_cond_init(&p->cond, NULL);
+ 
+@@ -289,8 +447,13 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
+ {
+     struct priv *p = mapper->priv;
+     struct priv_owner *o = mapper->owner->priv;
+-    GL *gl = ra_gl_get(mapper->ra);
+ 
++    if (o->use_surfacetexture) {
++        ra_tex_free(mapper->ra, &mapper->tex[0]);
++        return;
++    }
++
++    GL *gl = ra_gl_get(mapper->ra);
+     o->AImageReader_setImageListener(o->reader, NULL);
+ 
+     gl->DeleteTextures(1, &p->gl_texture);
+@@ -307,6 +470,9 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
+     struct priv *p = mapper->priv;
+     struct priv_owner *o = mapper->owner->priv;
+ 
++    if (o->use_surfacetexture)
++        return; // SurfaceTexture manages the texture content
++
+     if (p->egl_image) {
+         p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
+         p->egl_image = 0;
+@@ -324,6 +490,43 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+     struct priv_owner *o = mapper->owner->priv;
+     GL *gl = ra_gl_get(mapper->ra);
+ 
++    if (o->use_surfacetexture) {
++        // --- SurfaceTexture path ---
++        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
++            return -1;
++        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
++
++        JNIEnv *env = MP_JNI_GET_ENV(mapper);
++        if (!env)
++            return -1;
++
++        // Get timestamp before releasing buffer
++        jlong prev_ts = (*env)->CallLongMethod(env, o->surfaceTexture,
++                                               o->stGetTimestamp);
++
++        // Release decoded buffer to the Surface (renders the frame)
++        av_mediacodec_release_buffer(buffer, 1);
++
++        // Poll until SurfaceTexture receives the new frame (max ~100ms)
++        for (int i = 0; i < 50; i++) {
++            (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
++            if ((*env)->ExceptionCheck(env)) {
++                (*env)->ExceptionClear(env);
++                MP_WARN(mapper, "updateTexImage failed\n");
++                return -1;
++            }
++            jlong ts = (*env)->CallLongMethod(env, o->surfaceTexture,
++                                              o->stGetTimestamp);
++            if (ts != prev_ts)
++                break;
++            usleep(2000); // 2ms between polls
++        }
++
++        // OES texture is now updated — no further binding needed
++        return 0;
++    }
++
++    // --- Normal AImageReader path ---
+     {
+         if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
+             return -1;
+@@ -400,4 +603,4 @@ const struct ra_hwdec_driver ra_hwdec_aimagereader = {
+         .map = mapper_map,
+         .unmap = mapper_unmap,
+     },
+-};
++};
+\ No newline at end of file
