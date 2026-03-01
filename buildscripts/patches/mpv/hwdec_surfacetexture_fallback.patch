@@ -29,7 +29,7 @@
      media_status_t (*AImageReader_newWithUsage)(
          int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
      media_status_t (*AImageReader_getWindow)(
-@@ -73,6 +87,12 @@
+@@ -73,6 +87,17 @@
      EGLClientBuffer (EGLAPIENTRY *GetNativeClientBufferANDROID)(
          const struct AHardwareBuffer *);
      void (EGLAPIENTRY *EGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
@@ -39,10 +39,15 @@
 +    GLuint st_fbo_texture;
 +    GLuint st_program;
 +    GLint st_loc_transform;
++
++    // Cached transform matrix (avoids JNI alloc + GetFloatArrayRegion per frame)
++    jfloatArray st_mat_array;   // persistent jfloatArray(16), created once
++    float st_matrix[16];        // last known transform matrix
++    bool st_matrix_valid;       // true after first getTransformMatrix call
  };
  
  const static struct { const char *symbol; int offset; } lib_functions[] = {
-@@ -125,6 +145,208 @@
+@@ -125,6 +150,208 @@
      return true;
  }
  
@@ -251,7 +256,7 @@
  static int init(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
-@@ -138,8 +360,7 @@
+@@ -138,8 +365,7 @@
      if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
          return -1;
  
@@ -261,7 +266,7 @@
  
      static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
      static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
-@@ -149,29 +370,37 @@
+@@ -149,29 +375,37 @@
      else
          hw->glsl_extensions = es2_exts;
  
@@ -320,7 +325,7 @@
  
      p->hwctx = (struct mp_hwdec_ctx) {
          .driver_name = hw->driver->name,
-@@ -192,17 +421,22 @@
+@@ -192,17 +426,22 @@
  static void uninit(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
@@ -352,7 +357,7 @@
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -224,13 +458,137 @@
+@@ -224,13 +463,149 @@
      pthread_mutex_unlock(&p->lock);
  }
  
@@ -463,6 +468,18 @@
 +        if (!init_st_fbo(mapper, w, h))
 +            return -1;
 +
++        // Pre-allocate a persistent JNI float array for getTransformMatrix.
++        // Avoids NewFloatArray + DeleteLocalRef per frame.
++        JNIEnv *env = MP_JNI_GET_ENV(mapper);
++        if (env) {
++            jfloatArray local = (*env)->NewFloatArray(env, 16);
++            if (local) {
++                p->st_mat_array = (*env)->NewGlobalRef(env, local);
++                (*env)->DeleteLocalRef(env, local);
++            }
++        }
++        p->st_matrix_valid = false;
++
 +        mapper->dst_params = mapper->src_params;
 +        mapper->dst_params.imgfmt = IMGFMT_RGB0;
 +        mapper->dst_params.hw_subfmt = 0;
@@ -491,7 +508,7 @@
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +647,27 @@
+@@ -289,8 +664,33 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -513,6 +530,12 @@
 +            glDeleteProgram(p->st_program);
 +            p->st_program = 0;
 +        }
++        if (p->st_mat_array) {
++            JNIEnv *env = MP_JNI_GET_ENV(mapper);
++            if (env)
++                (*env)->DeleteGlobalRef(env, p->st_mat_array);
++            p->st_mat_array = NULL;
++        }
 +        return;
 +    }
 +
@@ -520,7 +543,7 @@
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +684,9 @@
+@@ -307,6 +707,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
@@ -530,7 +553,7 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +704,76 @@
+@@ -324,6 +727,67 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
@@ -547,12 +570,8 @@
 +        // Release decoded buffer to the Surface (renders the frame)
 +        av_mediacodec_release_buffer(buffer, 1);
 +
-+        // Latch the latest frame from the SurfaceTexture. On most devices
-+        // MediaCodec renders to the Surface within < 1ms after release.
-+        // If the new frame isn't ready yet, the previous frame is retained
-+        // on the texture — this causes a harmless one-frame repeat instead
-+        // of blocking the render thread (which caused massive frame drops
-+        // with the old polling loop).
++        // Latch the latest frame. MediaCodec typically renders within < 1ms.
++        // If not ready yet, the previous frame is retained (harmless repeat).
 +        (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
 +        if ((*env)->ExceptionCheck(env)) {
 +            (*env)->ExceptionClear(env);
@@ -560,26 +579,24 @@
 +            return -1;
 +        }
 +
-+        // Get the SurfaceTexture transform matrix (handles crop + Y-flip)
-+        jfloatArray matArr = (*env)->NewFloatArray(env, 16);
-+        (*env)->CallVoidMethod(env, o->surfaceTexture,
-+                               o->stGetTransformMatrix, matArr);
-+        float stMatrix[16];
-+        (*env)->GetFloatArrayRegion(env, matArr, 0, 16, stMatrix);
-+        (*env)->DeleteLocalRef(env, matArr);
++        // Fetch transform matrix once, then cache it. The matrix only changes
++        // when the video resolution changes, not per-frame.
++        if (!p->st_matrix_valid && p->st_mat_array) {
++            (*env)->CallVoidMethod(env, o->surfaceTexture,
++                                   o->stGetTransformMatrix, p->st_mat_array);
++            (*env)->GetFloatArrayRegion(env, p->st_mat_array, 0, 16,
++                                        p->st_matrix);
++            p->st_matrix_valid = true;
++        }
 +
-+        // Save GL state that we'll modify
-+        GLint prev_fbo = 0, prev_program = 0, prev_viewport[4];
-+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
-+        glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
-+        glGetIntegerv(GL_VIEWPORT, prev_viewport);
-+
-+        // Render OES texture → FBO with transform matrix applied
++        // FBO blit: OES texture → RGBA FBO with transform matrix.
++        // No GL state save/restore — MPV resets its own state before rendering.
++        // Eliminating 3x glGetIntegerv avoids GPU pipeline stalls per frame.
 +        glBindFramebuffer(GL_FRAMEBUFFER, p->st_fbo);
 +        glViewport(0, 0, mapper->src_params.w, mapper->src_params.h);
 +
 +        glUseProgram(p->st_program);
-+        glUniformMatrix4fv(p->st_loc_transform, 1, GL_FALSE, stMatrix);
++        glUniformMatrix4fv(p->st_loc_transform, 1, GL_FALSE, p->st_matrix);
 +
 +        glActiveTexture(GL_TEXTURE0);
 +        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, o->st_gl_texture);
@@ -592,13 +609,10 @@
 +        glDisableVertexAttribArray(0);
 +        glDisableVertexAttribArray(1);
 +
++        // Clean up — unbind to zero, don't restore previous state
 +        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-+
-+        // Restore GL state
-+        glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
-+        glUseProgram(prev_program);
-+        glViewport(prev_viewport[0], prev_viewport[1],
-+                   prev_viewport[2], prev_viewport[3]);
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        glUseProgram(0);
 +
 +        return 0;
 +    }
