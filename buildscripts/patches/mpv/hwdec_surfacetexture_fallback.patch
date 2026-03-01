@@ -1,5 +1,5 @@
---- a/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 21:19:37.718532500 +0100
-+++ b/video/out/hwdec/hwdec_aimagereader.c	2026-02-28 21:19:37.881374000 +0100
+--- a/video/out/hwdec/hwdec_aimagereader.c
++++ b/video/out/hwdec/hwdec_aimagereader.c
 @@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
@@ -530,7 +530,7 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +704,82 @@
+@@ -324,6 +704,76 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
@@ -544,26 +544,20 @@
 +        if (!env)
 +            return -1;
 +
-+        // Get timestamp before releasing buffer
-+        jlong prev_ts = (*env)->CallLongMethod(env, o->surfaceTexture,
-+                                               o->stGetTimestamp);
-+
 +        // Release decoded buffer to the Surface (renders the frame)
 +        av_mediacodec_release_buffer(buffer, 1);
 +
-+        // Poll until SurfaceTexture receives the new frame (max ~100ms)
-+        for (int i = 0; i < 50; i++) {
-+            (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
-+            if ((*env)->ExceptionCheck(env)) {
-+                (*env)->ExceptionClear(env);
-+                MP_WARN(mapper, "updateTexImage failed\n");
-+                return -1;
-+            }
-+            jlong ts = (*env)->CallLongMethod(env, o->surfaceTexture,
-+                                              o->stGetTimestamp);
-+            if (ts != prev_ts)
-+                break;
-+            usleep(2000); // 2ms between polls
++        // Latch the latest frame from the SurfaceTexture. On most devices
++        // MediaCodec renders to the Surface within < 1ms after release.
++        // If the new frame isn't ready yet, the previous frame is retained
++        // on the texture — this causes a harmless one-frame repeat instead
++        // of blocking the render thread (which caused massive frame drops
++        // with the old polling loop).
++        (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++            MP_WARN(mapper, "updateTexImage failed\n");
++            return -1;
 +        }
 +
 +        // Get the SurfaceTexture transform matrix (handles crop + Y-flip)
