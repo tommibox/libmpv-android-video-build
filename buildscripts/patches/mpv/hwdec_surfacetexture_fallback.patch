@@ -42,7 +42,7 @@
  };
  
  const static struct { const char *symbol; int offset; } lib_functions[] = {
-@@ -125,6 +145,205 @@
+@@ -125,6 +145,208 @@
      return true;
  }
  
@@ -73,7 +73,7 @@
 +    "}\n";
 +
 +// Fullscreen quad: position (x,y) + texcoord (s,t)
-+// Texcoords are Y-flipped (t: 1→0 instead of 0→1) so the SurfaceTexture
++// Texcoords are Y-flipped (t: 1->0 instead of 0->1) so the SurfaceTexture
 +// transform matrix's Y-flip and crop are preserved. Without this, a post-matrix
 +// Y-flip (tc.y = 1.0 - tc.y) would break the crop and expose green padding
 +// from MediaCodec's stride/slice-height alignment.
@@ -251,7 +251,7 @@
  static int init(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
-@@ -138,8 +357,7 @@
+@@ -138,8 +360,7 @@
      if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
          return -1;
  
@@ -261,7 +261,7 @@
  
      static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
      static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
-@@ -149,29 +367,37 @@
+@@ -149,29 +370,37 @@
      else
          hw->glsl_extensions = es2_exts;
  
@@ -320,7 +320,7 @@
  
      p->hwctx = (struct mp_hwdec_ctx) {
          .driver_name = hw->driver->name,
-@@ -192,17 +418,22 @@
+@@ -192,17 +421,22 @@
  static void uninit(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
@@ -352,7 +352,7 @@
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -224,13 +455,137 @@
+@@ -224,13 +458,137 @@
      pthread_mutex_unlock(&p->lock);
  }
  
@@ -491,7 +491,7 @@
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +644,27 @@
+@@ -289,8 +647,27 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -520,7 +520,7 @@
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +681,9 @@
+@@ -307,6 +684,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
@@ -530,7 +530,7 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +701,82 @@
+@@ -324,6 +704,82 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
