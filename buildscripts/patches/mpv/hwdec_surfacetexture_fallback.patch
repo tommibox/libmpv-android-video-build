@@ -29,23 +29,63 @@
      media_status_t (*AImageReader_newWithUsage)(
          int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
      media_status_t (*AImageReader_getWindow)(
-@@ -73,6 +87,8 @@
+@@ -73,6 +87,17 @@
      EGLClientBuffer (EGLAPIENTRY *GetNativeClientBufferANDROID)(
          const struct AHardwareBuffer *);
      void (EGLAPIENTRY *EGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
 +
-+    // (SurfaceTexture uses direct OES path — no FBO/shader state needed)
++    // SurfaceTexture FBO rendering
++    GLuint st_fbo;
++    GLuint st_fbo_texture;
++    GLuint st_program;
++    GLint st_loc_transform;
++
++    // Cached transform matrix (avoids JNI alloc + GetFloatArrayRegion per frame)
++    jfloatArray st_mat_array;   // persistent jfloatArray(16), created once
++    float st_matrix[16];        // last known transform matrix
++    bool st_matrix_valid;       // true after first getTransformMatrix call
  };
  
  const static struct { const char *symbol; int offset; } lib_functions[] = {
-@@ -125,6 +141,121 @@
+@@ -125,6 +150,152 @@
      return true;
  }
  
 +// --- SurfaceTexture fallback for devices missing AImageReader symbols ---
-+// Direct OES path: SurfaceTexture's OES texture is exposed directly to MPV.
-+// No FBO blit, no custom shaders — MPV handles the OES texture via its
-+// own shader pipeline (with GL_OES_EGL_image_external sampler).
++
++// Shader sources for OES -> RGBA FBO blit with SurfaceTexture transform matrix.
++// The transform matrix from SurfaceTexture.getTransformMatrix() maps texture
++// coordinates to the actual video region, handling stride alignment and Y-flip.
++
++static const char *st_vertex_shader =
++    "attribute vec4 aPosition;\n"
++    "attribute vec2 aTexCoord;\n"
++    "varying vec2 vTexCoord;\n"
++    "void main() {\n"
++    "    gl_Position = aPosition;\n"
++    "    vTexCoord = aTexCoord;\n"
++    "}\n";
++
++static const char *st_fragment_shader =
++    "#extension GL_OES_EGL_image_external : require\n"
++    "precision mediump float;\n"
++    "uniform samplerExternalOES uTexture;\n"
++    "uniform mat4 uSTMatrix;\n"
++    "varying vec2 vTexCoord;\n"
++    "void main() {\n"
++    "    vec2 tc = (uSTMatrix * vec4(vTexCoord, 0.0, 1.0)).xy;\n"
++    "    gl_FragColor = texture2D(uTexture, tc);\n"
++    "}\n";
++
++// Fullscreen quad: position (x,y) + texcoord (s,t)
++// Texcoords are Y-flipped (t: 1->0 instead of 0->1) so the SurfaceTexture
++// transform matrix's Y-flip and crop are preserved correctly.
++static const float st_quad_vertices[] = {
++    -1.0f, -1.0f,   0.0f, 1.0f,
++     1.0f, -1.0f,   1.0f, 1.0f,
++    -1.0f,  1.0f,   0.0f, 0.0f,
++     1.0f,  1.0f,   1.0f, 0.0f,
++};
 +
 +static bool init_surfacetexture(struct ra_hwdec *hw)
 +{
@@ -121,7 +161,7 @@
 +    (*env)->DeleteLocalRef(env, stClass);
 +    (*env)->DeleteLocalRef(env, surfaceClass);
 +
-+    MP_INFO(hw, "SurfaceTexture fallback initialized, direct OES path (texture=%u)\n",
++    MP_INFO(hw, "SurfaceTexture fallback initialized (texture=%u)\n",
 +            p->st_gl_texture);
 +    return true;
 +}
@@ -160,7 +200,7 @@
  static int init(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
-@@ -138,8 +269,7 @@
+@@ -138,8 +309,7 @@
      if (!gl_check_extension(exts, "EGL_ANDROID_image_native_buffer"))
          return -1;
  
@@ -170,7 +210,7 @@
  
      static const char *es2_exts[] = {"GL_OES_EGL_image_external", 0};
      static const char *es3_exts[] = {"GL_OES_EGL_image_external_essl3", 0};
-@@ -149,29 +279,37 @@
+@@ -149,29 +319,37 @@
      else
          hw->glsl_extensions = es2_exts;
  
@@ -229,7 +269,7 @@
  
      p->hwctx = (struct mp_hwdec_ctx) {
          .driver_name = hw->driver->name,
-@@ -192,17 +330,22 @@
+@@ -192,17 +370,22 @@
  static void uninit(struct ra_hwdec *hw)
  {
      struct priv_owner *p = hw->priv;
@@ -261,7 +301,100 @@
      }
  
      hwdec_devices_remove(hw->devs, &p->hwctx);
-@@ -228,9 +371,42 @@
+@@ -224,13 +407,146 @@
+     pthread_mutex_unlock(&p->lock);
+ }
+ 
++// Create FBO + shader for SurfaceTexture OES -> RGBA blit
++static bool init_st_fbo(struct ra_hwdec_mapper *mapper, int w, int h)
++{
++    struct priv *p = mapper->priv;
++    GL *gl = ra_gl_get(mapper->ra);
++
++    // Create RGBA texture as FBO render target
++    gl->GenTextures(1, &p->st_fbo_texture);
++    gl->BindTexture(GL_TEXTURE_2D, p->st_fbo_texture);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
++                 GL_UNSIGNED_BYTE, NULL);
++    gl->BindTexture(GL_TEXTURE_2D, 0);
++
++    // Create FBO
++    glGenFramebuffers(1, &p->st_fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, p->st_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, p->st_fbo_texture, 0);
++    GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
++        MP_ERR(mapper, "SurfaceTexture FBO incomplete: 0x%x\n", fbo_status);
++        return false;
++    }
++
++    // Compile shader program
++    GLuint vert = glCreateShader(GL_VERTEX_SHADER);
++    glShaderSource(vert, 1, &st_vertex_shader, NULL);
++    glCompileShader(vert);
++    GLint status = 0;
++    glGetShaderiv(vert, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char buf[512];
++        glGetShaderInfoLog(vert, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST vertex shader error: %s\n", buf);
++        glDeleteShader(vert);
++        return false;
++    }
++
++    GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
++    glShaderSource(frag, 1, &st_fragment_shader, NULL);
++    glCompileShader(frag);
++    glGetShaderiv(frag, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char buf[512];
++        glGetShaderInfoLog(frag, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST fragment shader error: %s\n", buf);
++        glDeleteShader(vert);
++        glDeleteShader(frag);
++        return false;
++    }
++
++    p->st_program = glCreateProgram();
++    glAttachShader(p->st_program, vert);
++    glAttachShader(p->st_program, frag);
++    glBindAttribLocation(p->st_program, 0, "aPosition");
++    glBindAttribLocation(p->st_program, 1, "aTexCoord");
++    glLinkProgram(p->st_program);
++    glDeleteShader(vert);
++    glDeleteShader(frag);
++
++    GLint linked = 0;
++    glGetProgramiv(p->st_program, GL_LINK_STATUS, &linked);
++    if (!linked) {
++        char buf[512];
++        glGetProgramInfoLog(p->st_program, sizeof(buf), NULL, buf);
++        MP_ERR(mapper, "ST program link error: %s\n", buf);
++        glDeleteProgram(p->st_program);
++        p->st_program = 0;
++        return false;
++    }
++
++    p->st_loc_transform = glGetUniformLocation(p->st_program, "uSTMatrix");
++    GLint tex_loc = glGetUniformLocation(p->st_program, "uTexture");
++
++    // Set texture unit 0 for the sampler (once, doesn't change)
++    glUseProgram(p->st_program);
++    glUniform1i(tex_loc, 0);
++    glUseProgram(0);
++
++    MP_INFO(mapper, "SurfaceTexture FBO initialized (%dx%d)\n", w, h);
++    return true;
++}
++
+ static int mapper_init(struct ra_hwdec_mapper *mapper)
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -270,34 +403,45 @@
      p->log = mapper->log;
 +
 +    if (o->use_surfacetexture) {
-+        // SurfaceTexture path: expose OES texture directly to MPV.
-+        // No FBO blit — MPV handles the OES texture via its shader pipeline,
-+        // just like the AImageReader path. This eliminates the extra GPU
-+        // render pass that was causing frame drops on Fire TV.
++        // SurfaceTexture path: OES -> RGBA FBO blit, expose FBO texture to MPV.
++        int w = mapper->src_params.w;
++        int h = mapper->src_params.h;
++
++        if (!init_st_fbo(mapper, w, h))
++            return -1;
++
++        // Pre-allocate a persistent JNI float array for getTransformMatrix
++        JNIEnv *env = MP_JNI_GET_ENV(mapper);
++        if (env) {
++            jfloatArray local = (*env)->NewFloatArray(env, 16);
++            if (local) {
++                p->st_mat_array = (*env)->NewGlobalRef(env, local);
++                (*env)->DeleteLocalRef(env, local);
++            }
++        }
++        p->st_matrix_valid = false;
++
 +        mapper->dst_params = mapper->src_params;
 +        mapper->dst_params.imgfmt = IMGFMT_RGB0;
 +        mapper->dst_params.hw_subfmt = 0;
 +
++        // Wrap the FBO RGBA texture for MPV
 +        struct ra_tex_params params = {
 +            .dimensions = 2,
-+            .w = mapper->src_params.w,
-+            .h = mapper->src_params.h,
++            .w = w,
++            .h = h,
 +            .d = 1,
 +            .format = ra_find_unorm_format(mapper->ra, 1, 4),
 +            .render_src = true,
 +            .src_linear = true,
-+            .external_oes = true,   // OES texture directly, no FBO blit
++            .external_oes = false,  // regular RGBA texture from FBO
 +        };
 +        if (params.format->ctype != RA_CTYPE_UNORM)
 +            return -1;
 +
 +        mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params,
-+                                               o->st_gl_texture);
-+        if (!mapper->tex[0])
-+            return -1;
-+
-+        MP_INFO(mapper, "SurfaceTexture direct OES path (no FBO blit)\n");
-+        return 0;
++                                               p->st_fbo_texture);
++        return mapper->tex[0] ? 0 : -1;
 +    }
 +
 +    // Normal AImageReader path
@@ -305,7 +449,7 @@
      pthread_mutex_init(&p->lock, NULL);
      pthread_cond_init(&p->cond, NULL);
  
-@@ -289,8 +465,13 @@
+@@ -289,8 +605,33 @@
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
@@ -313,6 +457,26 @@
  
 +    if (o->use_surfacetexture) {
 +        ra_tex_free(mapper->ra, &mapper->tex[0]);
++
++        if (p->st_fbo) {
++            glDeleteFramebuffers(1, &p->st_fbo);
++            p->st_fbo = 0;
++        }
++        if (p->st_fbo_texture) {
++            GL *gl = ra_gl_get(mapper->ra);
++            gl->DeleteTextures(1, &p->st_fbo_texture);
++            p->st_fbo_texture = 0;
++        }
++        if (p->st_program) {
++            glDeleteProgram(p->st_program);
++            p->st_program = 0;
++        }
++        if (p->st_mat_array) {
++            JNIEnv *env = MP_JNI_GET_ENV(mapper);
++            if (env)
++                (*env)->DeleteGlobalRef(env, p->st_mat_array);
++            p->st_mat_array = NULL;
++        }
 +        return;
 +    }
 +
@@ -320,7 +484,7 @@
      o->AImageReader_setImageListener(o->reader, NULL);
  
      gl->DeleteTextures(1, &p->gl_texture);
-@@ -307,6 +488,9 @@
+@@ -307,6 +648,9 @@
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
  
@@ -330,12 +494,12 @@
      if (p->egl_image) {
          p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
          p->egl_image = 0;
-@@ -324,6 +508,32 @@
+@@ -324,6 +668,76 @@
      struct priv_owner *o = mapper->owner->priv;
      GL *gl = ra_gl_get(mapper->ra);
  
 +    if (o->use_surfacetexture) {
-+        // --- SurfaceTexture direct OES path (no FBO blit) ---
++        // --- SurfaceTexture path with FBO blit ---
 +        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
 +            return -1;
 +        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
@@ -344,17 +508,61 @@
 +        if (!env)
 +            return -1;
 +
++        // Drain previous frame FIRST to free BufferQueue slot,
++        // then release new buffer. This reduces backpressure on
++        // MediaCodec's output buffer queue.
++        (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++            // First frame has nothing to drain, continue normally
++        }
++
 +        // Release decoded buffer to the Surface (renders the frame)
 +        av_mediacodec_release_buffer(buffer, 1);
 +
-+        // Latch the latest frame onto the OES texture.
-+        // MPV will sample from this texture directly via its shader pipeline.
++        // Latch the newly released frame
 +        (*env)->CallVoidMethod(env, o->surfaceTexture, o->stUpdateTexImage);
 +        if ((*env)->ExceptionCheck(env)) {
 +            (*env)->ExceptionClear(env);
 +            MP_WARN(mapper, "updateTexImage failed\n");
 +            return -1;
 +        }
++
++        // Fetch transform matrix once, then cache it
++        if (!p->st_matrix_valid && p->st_mat_array) {
++            (*env)->CallVoidMethod(env, o->surfaceTexture,
++                                   o->stGetTransformMatrix, p->st_mat_array);
++            (*env)->GetFloatArrayRegion(env, p->st_mat_array, 0, 16,
++                                        p->st_matrix);
++            p->st_matrix_valid = true;
++        }
++
++        // FBO blit: OES texture -> RGBA FBO with transform matrix.
++        // No GL state save/restore — MPV resets its own state before rendering.
++        glBindFramebuffer(GL_FRAMEBUFFER, p->st_fbo);
++        glViewport(0, 0, mapper->src_params.w, mapper->src_params.h);
++
++        glUseProgram(p->st_program);
++        glUniformMatrix4fv(p->st_loc_transform, 1, GL_FALSE, p->st_matrix);
++
++        glActiveTexture(GL_TEXTURE0);
++        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, o->st_gl_texture);
++
++        glEnableVertexAttribArray(0);
++        glEnableVertexAttribArray(1);
++        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, st_quad_vertices);
++        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, st_quad_vertices + 2);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        glDisableVertexAttribArray(0);
++        glDisableVertexAttribArray(1);
++
++        // Flush GPU commands to pipeline the blit — don't block with glFinish
++        glFlush();
++
++        // Clean up — unbind to zero, don't restore previous state
++        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        glUseProgram(0);
 +
 +        return 0;
 +    }
@@ -363,3 +571,10 @@
      {
          if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
              return -1;
+@@ -400,4 +814,4 @@
+         .map = mapper_map,
+         .unmap = mapper_unmap,
+     },
+-};
++};
+\ No newline at end of file
