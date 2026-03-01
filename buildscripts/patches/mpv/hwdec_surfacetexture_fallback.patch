@@ -1,5 +1,5 @@
---- hwdec_aimagereader_original.c	2026-03-01 14:39:36.577309800 +0100
-+++ hwdec_aimagereader_patched.c	2026-03-01 14:38:28.816226600 +0100
+--- a/video/out/hwdec/hwdec_aimagereader.c
++++ b/video/out/hwdec/hwdec_aimagereader.c
 @@ -20,7 +20,10 @@
  #include <assert.h>
  #include <pthread.h>
