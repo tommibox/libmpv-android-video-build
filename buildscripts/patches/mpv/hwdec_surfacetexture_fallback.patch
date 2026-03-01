@@ -69,16 +69,19 @@
 +    "varying vec2 vTexCoord;\n"
 +    "void main() {\n"
 +    "    vec2 tc = (uSTMatrix * vec4(vTexCoord, 0.0, 1.0)).xy;\n"
-+    "    tc.y = 1.0 - tc.y;\n"
 +    "    gl_FragColor = texture2D(uTexture, tc);\n"
 +    "}\n";
 +
 +// Fullscreen quad: position (x,y) + texcoord (s,t)
++// Texcoords are Y-flipped (t: 1→0 instead of 0→1) so the SurfaceTexture
++// transform matrix's Y-flip and crop are preserved. Without this, a post-matrix
++// Y-flip (tc.y = 1.0 - tc.y) would break the crop and expose green padding
++// from MediaCodec's stride/slice-height alignment.
 +static const float st_quad_vertices[] = {
-+    -1.0f, -1.0f,   0.0f, 0.0f,
-+     1.0f, -1.0f,   1.0f, 0.0f,
-+    -1.0f,  1.0f,   0.0f, 1.0f,
-+     1.0f,  1.0f,   1.0f, 1.0f,
++    -1.0f, -1.0f,   0.0f, 1.0f,
++     1.0f, -1.0f,   1.0f, 1.0f,
++    -1.0f,  1.0f,   0.0f, 0.0f,
++     1.0f,  1.0f,   1.0f, 0.0f,
 +};
 +
 +static GLuint compile_st_shader(struct ra_hwdec *hw, GLenum type, const char *source)
